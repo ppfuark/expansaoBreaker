@@ -2,21 +2,7 @@
 const fs = require("fs");
 const XLSX = require("xlsx");
 const puppeteer = require("puppeteer-core");
-
-const CFG = {
-  EXCEL_FILE: "usuarios.xlsx",
-  SHEET_NAME: null,
-  TARGET_URL: "https://crimsonstrauss.xyz/expansao",
-  CLICK_SUBMIT: true,
-  HEADLESS: false,
-  NAVIGATION_TIMEOUT: 20000,
-  MIN_DELAY_MS: 2000,
-  MAX_DELAY_MS: 10000,
-  WAIT_AFTER_CLICK_MS: 25000,
-  LOG_FILE: "autofill_log.csv",
-  MAX_RETRIES: 3,
-  MAX_ACTIVITY_WAIT_MINUTES: 15, // Aumentado para 15 minutos
-};
+const chromeLauncher = require('chrome-launcher');
 
 // Cores para logs
 const colors = {
@@ -31,6 +17,21 @@ const colors = {
   white: '\x1b[37m'
 };
 
+// Configurações (deve ser definida antes das funções que a usam)
+const CFG = {
+  EXCEL_FILE: "usuarios.xlsx",
+  TARGET_URL: "https://crimsonstrauss.xyz/expansao",
+  HEADLESS: false,
+  NAVIGATION_TIMEOUT: 20000,
+  MIN_DELAY_MS: 2000,
+  MAX_DELAY_MS: 10000,
+  LOG_FILE: "autofill_log.csv",
+  MAX_RETRIES: 3,
+  CLICK_SUBMIT: true,
+  SHEET_NAME: null,
+  MAX_ACTIVITY_WAIT_MINUTES: 30
+};
+
 function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
 }
@@ -42,7 +43,7 @@ function randBetween(min, max) {
 function detectColumn(keys, possibles) {
   const lower = keys.map((k) => k.toLowerCase());
   for (const p of possibles) {
-    const idx = lower.findIndex((k) => k.includes(p));
+    const idx = lower.findIndex((k) => k.includes(p.toLowerCase()));
     if (idx !== -1) return keys[idx];
   }
   return null;
@@ -88,7 +89,7 @@ async function reopenCoursesModal(mainPage, userId, retries = CFG.MAX_RETRIES) {
       
       await mainPage.waitForSelector("#coursesModal", {
         visible: true,
-        timeout: 10000
+        timeout: 30000
       });
       
       await sleep(2000);
@@ -112,6 +113,7 @@ async function reopenCoursesModal(mainPage, userId, retries = CFG.MAX_RETRIES) {
     }
   }
 }
+
 async function waitForActivitiesCompletion(mainPage, userId, courseName) {
   let startTime = Date.now();
   const maxWaitTime = CFG.MAX_ACTIVITY_WAIT_MINUTES * 60 * 1000;
@@ -125,22 +127,20 @@ async function waitForActivitiesCompletion(mainPage, userId, courseName) {
   while (Date.now() - startTime < maxWaitTime) {
     try {
       // Aguarda um tempo mínimo antes da primeira verificação
-      if (Date.now() - startTime < 30000) { // 30 segundos mínimos
+      if (Date.now() - startTime < 30000) {
         await sleep(5000);
         continue;
       }
 
-      // Verifica o progresso atual de forma mais específica
+      // Verifica o progresso atual
       const progressInfo = await mainPage.evaluate(() => {
-        // Procura por elementos que mostram progresso
         const progressElements = [
           document.querySelector('[class*="progress"]'),
           document.querySelector('[class*="status"]'),
-          document.querySelector('[class*="completion"]'),
-          document.querySelector('body').textContent.match(/\d+\s*\/\s*\d+/g)
-        ].filter(Boolean);
+          document.querySelector('[class*="completion"]')
+        ].filter(el => el && el.textContent);
 
-        // Procura por mensagens de conclusão
+        const pageText = document.body.textContent.toLowerCase();
         const completionIndicators = [
           'processamento concluído',
           'todas as atividades concluídas',
@@ -149,9 +149,7 @@ async function waitForActivitiesCompletion(mainPage, userId, courseName) {
           'atividades finalizadas'
         ];
 
-        const pageText = document.body.textContent.toLowerCase();
         let isCompleted = false;
-        
         for (const indicator of completionIndicators) {
           if (pageText.includes(indicator)) {
             isCompleted = true;
@@ -161,8 +159,7 @@ async function waitForActivitiesCompletion(mainPage, userId, courseName) {
 
         return {
           progress: progressElements[0] ? progressElements[0].textContent.trim() : '',
-          isCompleted: isCompleted,
-          pageText: pageText
+          isCompleted: isCompleted
         };
       });
 
@@ -171,7 +168,6 @@ async function waitForActivitiesCompletion(mainPage, userId, courseName) {
         logCourse(userId, courseName, `Progresso: ${progressInfo.progress}`, 'cyan');
         lastProgress = progressInfo.progress;
         
-        // Tenta extrair números do progresso (ex: "2/8")
         const progressMatch = progressInfo.progress.match(/(\d+)\s*\/\s*(\d+)/);
         if (progressMatch) {
           completedCount = parseInt(progressMatch[1]);
@@ -185,13 +181,12 @@ async function waitForActivitiesCompletion(mainPage, userId, courseName) {
         consecutiveCompletions++;
         logCourse(userId, courseName, `Conclusão detectada (${consecutiveCompletions}/3)`, 'green');
         
-        // Espera por 3 verificações consecutivas para confirmar
         if (consecutiveCompletions >= 3) {
           logSuccess(userId, `Todas as atividades de ${courseName} concluídas!`);
           return true;
         }
       } else {
-        consecutiveCompletions = 0; // Reseta se não estiver completo
+        consecutiveCompletions = 0;
       }
 
       // Verifica se há erro
@@ -222,22 +217,20 @@ async function waitForActivitiesCompletion(mainPage, userId, courseName) {
         return false;
       }
 
-      // Verifica se a página mudou (curso foi redirecionado ou finalizado)
+      // Verifica se a página mudou
       const currentUrl = await mainPage.url();
       if (!currentUrl.includes(CFG.TARGET_URL)) {
         logCourse(userId, courseName, `Redirecionamento detectado, assumindo conclusão`, 'green');
         return true;
       }
 
-      // Aguarda antes de verificar novamente
-      await sleep(10000); // Verifica a cada 10 segundos
+      await sleep(10000);
 
     } catch (error) {
       logWarning(userId, `Erro ao verificar progresso: ${error.message}`);
       await sleep(5000);
       
-      // Se houver muitos erros, assume que terminou
-      if (Date.now() - startTime > 600000) { // 10 minutos
+      if (Date.now() - startTime > 600000) {
         logWarning(userId, `Muitos erros, assumindo conclusão de ${courseName}`);
         return true;
       }
@@ -267,13 +260,13 @@ async function processCourse(mainPage, course, raVal, senhaVal, userId) {
       if (courseElement) {
         logCourse(userId, course.name, "Clicando no curso...", 'cyan');
         await courseElement.click();
-        await sleep(5000); // Aumentado para 5 segundos
+        await sleep(5000);
 
         // Verifica qual modal apareceu
         const modalResult = await mainPage.evaluate(() => {
           // Primeiro verifica modal de quiz
           const quizModal = document.querySelector('#quizConfirmationModal');
-          if (quizModal && getComputedStyle(quizModal).display !== 'none') {
+          if (quizModal && window.getComputedStyle(quizModal).display !== 'none') {
             const processBtn = document.querySelector('#processQuizDefaultTimeBtn');
             if (processBtn) {
               processBtn.click();
@@ -283,8 +276,8 @@ async function processCourse(mainPage, course, raVal, senhaVal, userId) {
           
           // Depois verifica modal normal
           const normalModal = document.querySelector('#confirmationModal');
-          if (normalModal && getComputedStyle(normalModal).display !== 'none') {
-            const processBtn = document.querySelector('#processCourseBtn, button:contains("Processar"), button:contains("Confirmar")');
+          if (normalModal && window.getComputedStyle(normalModal).display !== 'none') {
+            const processBtn = document.querySelector('#processCourseBtn');
             if (processBtn) {
               processBtn.click();
               return 'course_processing';
@@ -292,37 +285,24 @@ async function processCourse(mainPage, course, raVal, senhaVal, userId) {
             return 'no_process_button';
           }
           
-          // Verifica se já está processando
-          const processingElements = document.querySelectorAll('[class*="processing"], [class*="progress"]');
-          if (processingElements.length > 0) {
-            return 'already_processing';
-          }
-          
           return 'no_modal_found';
         });
 
-        if (modalResult === 'quiz_processing' || modalResult === 'course_processing' || modalResult === 'already_processing') {
+        if (modalResult === 'quiz_processing' || modalResult === 'course_processing') {
           if (modalResult === 'quiz_processing') {
             logCourse(userId, course.name, "Questionário iniciado", 'green');
-          } else if (modalResult === 'course_processing') {
-            logCourse(userId, course.name, "Processamento do curso iniciado", 'green');
           } else {
-            logCourse(userId, course.name, "Processamento já em andamento", 'green');
+            logCourse(userId, course.name, "Processamento do curso iniciado", 'green');
           }
           
-          // ESPERA TODAS AS ATIVIDADES SEREM CONCLUÍDAS
-          logCourse(userId, course.name, "Aguardando conclusão de TODAS as atividades...", 'yellow');
           const completed = await waitForActivitiesCompletion(mainPage, userId, course.name);
           
           if (completed) {
             logSuccess(userId, `Curso concluído: ${course.name}`);
             success = true;
-            
-            // Aguarda um tempo extra para garantir
             await sleep(5000);
           } else {
             logWarning(userId, `Curso pode não estar totalmente concluído: ${course.name}`);
-            // Mesmo assim marca como sucesso para continuar
             success = true;
           }
           
@@ -336,15 +316,12 @@ async function processCourse(mainPage, course, raVal, senhaVal, userId) {
         logWarning(userId, `Curso não encontrado no modal: ${course.name}`);
       }
 
-      // Fecha qualquer modal ou notificação
+      // Fecha qualquer modal
       await mainPage.evaluate(() => {
         const closeBtns = [
           "#closeCoursesModal",
           ".close-modal",
-          ".notification-close",
-          ".btn-secondary",
-          'button:contains("Fechar")',
-          'button:contains("Close")'
+          ".btn-secondary"
         ];
         
         for (const selector of closeBtns) {
@@ -390,7 +367,7 @@ async function processUser(browser, row, keys, colRa, colDigito, colEstado, colS
     if (altPwd) senhaVal = safeText(row[altPwd]);
   }
 
-  const userId = raVal.substring(0, 8) + '...'; // Mostra apenas os primeiros caracteres por segurança
+  const userId = raVal.substring(0, 8) + '...';
   const ts = new Date().toISOString();
   appendLog(`${ts},${raVal},${senhaVal},start,linha_${index + 1}`);
   
@@ -454,8 +431,8 @@ async function processUser(browser, row, keys, colRa, colDigito, colEstado, colS
           courseElements.forEach((el, index) => {
             const courseId = el.getAttribute('data-course-id');
             const courseName = el.getAttribute('data-course-name') || 
-                             el.querySelector('label')?.textContent?.split('(')[0]?.trim() || 
-                             `Curso ${index + 1}`;
+                             (el.querySelector('label') ? el.querySelector('label').textContent.split('(')[0].trim() : 
+                             `Curso ${index + 1}`);
             courses.push({ id: courseId, name: courseName, index });
           });
           
@@ -513,14 +490,25 @@ async function processUser(browser, row, keys, colRa, colDigito, colEstado, colS
 async function main() {
   console.log(`${colors.bright}${colors.magenta}=== INICIANDO PROCESSAMENTO ===${colors.reset}`);
   
+  // Detecta o Chrome instalado dinamicamente
+  const installations = await chromeLauncher.Launcher.getInstallations();
+  if (installations.length === 0) {
+    console.error("Nenhuma instalação do Chrome encontrada!");
+    process.exit(1);
+  }
+  const chromePath = installations[0];
+  console.log(`${colors.green}Chrome encontrado em:${colors.reset} ${chromePath}`);
+
   if (!fs.existsSync(CFG.EXCEL_FILE)) {
     console.error(`Arquivo não encontrado: ${CFG.EXCEL_FILE}`);
     process.exit(1);
   }
+  
   const wb = XLSX.readFile(CFG.EXCEL_FILE);
   const sheetName = CFG.SHEET_NAME || wb.SheetNames[0];
   const sheet = wb.Sheets[sheetName];
   const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+  
   if (!rows || rows.length === 0) {
     console.error("Planilha vazia.");
     process.exit(1);
@@ -544,23 +532,25 @@ async function main() {
 
   const browser = await puppeteer.launch({
     headless: CFG.HEADLESS,
-    executablePath: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    executablePath: chromePath,
     defaultViewport: { width: 1200, height: 800 },
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
 
-  // PROCESSAMENTO PARALELO DE USUÁRIOS
-  const userPromises = rows.map((row, index) => 
-    processUser(browser, row, keys, colRa, colDigito, colEstado, colSenha, index, rows.length)
-  );
-  
-  await Promise.all(userPromises);
+  console.log(`${colors.green}Browser iniciado com sucesso!${colors.reset}`);
+
+  // Processa usuários sequencialmente (não em paralelo)
+  for (let i = 0; i < rows.length; i++) {
+    await processUser(browser, rows[i], keys, colRa, colDigito, colEstado, colSenha, i, rows.length);
+  }
 
   await browser.close();
   console.log(`\n${colors.bright}${colors.magenta}=== PROCESSAMENTO CONCLUÍDO ===${colors.reset}`);
   console.log(`${colors.green}Log salvo em: ${CFG.LOG_FILE}${colors.reset}`);
 }
 
+// Executa o script
 main().catch((err) => {
   console.error(`${colors.red}Erro fatal: ${err}${colors.reset}`);
+  process.exit(1);
 });
